@@ -51,29 +51,41 @@
         </div>
     </div>
 
+
     <script>
         const canvas = document.getElementById('sim');
         const ctx = canvas.getContext('2d');
-
         const dpr = window.devicePixelRatio || 1;
 
-        const NUM_PARTICLES = 1550;
-        const AMBIENT_TEMP = 20;        // °C, arbitrary
-        const GRAVITY = 50;             // downward accel (px/s²)
-        const BUOYANCY = 3;             // upward accel per °C above ambient
-        const COOL_RATE = 0.25;         // fractional cooling per second
-        const DRAG = 0.2;               // velocity damping
-        const MAX_TEMP = 200;           // clamp for coloring
-        const HEAT_RADIUS = 80;         // px
-        const HEAT_RATE = 200;          // °C per second at center
-        const REP_RADIUS = 18;          // px
-        const REP_STRENGTH = 250;       // repulsive strength
+        const NUM_PARTICLES = 900
+        const AMBIENT_TEMP = 20;
+        const GRAVITY = 50;
+        const BUOYANCY = 4;
+        const COOL_RATE = 0.2;
+        const DRAG = 0.2;
+        const MAX_TEMP = 500;
+        const HEAT_RADIUS = 120;
+        const HEAT_RATE = 500;
+        const REP_RADIUS_BASE = 40;     // base "size" at ambient
+        const THERMAL_EXPANSION = 0.8;  // hotter => bigger effective radius
         const MAX_SPEED = 150;
-        const REP_RADIUS_BASE = 24;   // base repulsion radius at ambient temp
-        const THERMAL_EXPANSION = 0.8; // how much hotter particles expand (0.8 ≈ +80% at MAX_TEMP)
+        const SOLVER_ITERATIONS = 1;    // repulsion iterations per frame
+        let bgGrad = null;
 
         let width = 0;
         let height = 0;
+
+        const COLOR_LUT_SIZE = 64;
+        const colorLUT = new Array(COLOR_LUT_SIZE);
+
+        function buildColorLUT() {
+            for (let i = 0; i < COLOR_LUT_SIZE; i++) {
+                const t = i / (COLOR_LUT_SIZE - 1);
+                const hue = 220 - 210 * t;
+                const light = 40 + 20 * t;
+                colorLUT[i] = `hsl(${hue}, 90%, ${light}%)`;
+            }
+        }
 
         function resize() {
             const rect = canvas.getBoundingClientRect();
@@ -82,6 +94,9 @@
             canvas.width = width * dpr;
             canvas.height = height * dpr;
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            bgGrad = ctx.createLinearGradient(0, height, 0, 0);
+            bgGrad.addColorStop(0, '#050814');
+            bgGrad.addColorStop(1, '#1a1010');
         }
 
         window.addEventListener('resize', () => {
@@ -89,77 +104,27 @@
             resetParticles();
         });
 
-        function thermalFactor(temp) {
-            // 0 at ambient, 1 at MAX_TEMP
-            const tNorm = Math.max(0, Math.min(1, (temp - AMBIENT_TEMP) / (MAX_TEMP - AMBIENT_TEMP)));
-            // factor from 1.0 (ambient) to 1 + THERMAL_EXPANSION (max hot)
-            return 1 + THERMAL_EXPANSION * tNorm;
-        }
-
         class Particle {
             constructor(x, y) {
                 this.x = x;
                 this.y = y;
+                this.px = x; // previous position (for velocity reconstruction)
+                this.py = y;
                 this.vx = (Math.random() - 0.5) * 20;
                 this.vy = (Math.random() - 0.5) * 20;
                 this.temp = AMBIENT_TEMP + (Math.random() - 0.5) * 5;
                 this.r = 3;
             }
 
-            update(dt) {
-                // Cool toward ambient
-                this.temp += (AMBIENT_TEMP - this.temp) * COOL_RATE * dt;
-
-                const tempDiff = this.temp - AMBIENT_TEMP;
-                const ay = GRAVITY - BUOYANCY * Math.max(tempDiff, 0);
-                this.vy += ay * dt;
-
-                // Simple drag
-                const dragFactor = Math.max(0, 1 - DRAG * dt);
-                this.vx *= dragFactor;
-                this.vy *= dragFactor;
-
-                // Clamp speed
-                let speed = Math.hypot(this.vx, this.vy);
-                if (speed > MAX_SPEED) {
-                    const s = MAX_SPEED / speed;
-                    this.vx *= s;
-                    this.vy *= s;
-                }
-
-                // Integrate
-                this.x += this.vx * dt;
-                this.y += this.vy * dt;
-
-                // Walls...
-                if (this.x < this.r) {
-                    this.x = this.r;
-                    this.vx *= -0.5;
-                } else if (this.x > width - this.r) {
-                    this.x = width - this.r;
-                    this.vx *= -0.5;
-                }
-
-                if (this.y < this.r) {
-                    this.y = this.r;
-                    this.vy *= -0.5;
-                } else if (this.y > height - this.r) {
-                    this.y = height - this.r;
-                    this.vy *= -0.5;
-                }
-            }
-
-
             draw(ctx) {
-                // Map temperature to color (cool = blue, hot = yellow/red)
-                const tNorm = Math.max(0, Math.min(1, (this.temp - AMBIENT_TEMP) / (MAX_TEMP - AMBIENT_TEMP)));
-                // Hue from ~220° (blue) down to ~10° (red)
-                const hue = 220 - 210 * tNorm;
-                const light = 40 + 20 * tNorm; // a bit brighter when hot
-
+                const tNorm = Math.max(
+                    0,
+                    Math.min(1, (this.temp - AMBIENT_TEMP) / (MAX_TEMP - AMBIENT_TEMP))
+                );
+                const idx = (tNorm * (COLOR_LUT_SIZE - 1)) | 0;
                 ctx.beginPath();
                 ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
-                ctx.fillStyle = `hsl(${hue}, 90%, ${light}%)`;
+                ctx.fillStyle = colorLUT[idx];
                 ctx.fill();
             }
         }
@@ -175,67 +140,70 @@
             }
         }
 
+        function thermalFactor(temp) {
+            const tNorm = Math.max(
+                0,
+                Math.min(1, (temp - AMBIENT_TEMP) / (MAX_TEMP - AMBIENT_TEMP))
+            );
+            return 1 + THERMAL_EXPANSION * tNorm; // 1 at ambient, >1 when hot
+        }
 
-        // Repulsive force so the "fluid" doesn't collapse into clumps
-        function applyRepulsion() {
-            for (let i = 0; i < particles.length; i++) {
-                const p = particles[i];
+        // Position-based repulsion: only moves positions, doesn’t kick velocities directly
+        function solveRepulsion() {
+            for (let iter = 0; iter < SOLVER_ITERATIONS; iter++) {
+                for (let i = 0; i < particles.length; i++) {
+                    const p = particles[i];
+                    const pRep = REP_RADIUS_BASE * thermalFactor(p.temp);
 
-                // Temperature-dependent repulsion radius for p
-                const pRep = REP_RADIUS_BASE * thermalFactor(p.temp);
+                    for (let j = i + 1; j < particles.length; j++) {
+                        const q = particles[j];
+                        const qRep = REP_RADIUS_BASE * thermalFactor(q.temp);
 
-                for (let j = i + 1; j < particles.length; j++) {
-                    const q = particles[j];
+                        const pairRadius = 0.5 * (pRep + qRep);
+                        const pairRadius2 = pairRadius * pairRadius;
 
-                    // Temperature-dependent repulsion radius for q
-                    const qRep = REP_RADIUS_BASE * thermalFactor(q.temp);
+                        let dx = q.x - p.x;
+                        let dy = q.y - p.y;
+                        let dist2 = dx * dx + dy * dy;
 
-                    // Use the average as the effective pair radius
-                    const pairRadius = 0.5 * (pRep + qRep);
-                    const r2 = pairRadius * pairRadius;
+                        if (dist2 > 0 && dist2 < pairRadius2) {
+                            let dist = Math.sqrt(dist2);
 
-                    let dx = q.x - p.x;
-                    let dy = q.y - p.y;
-                    let dist2 = dx * dx + dy * dy;
+                            if (dist < 1e-4) {
+                                // If essentially on top of each other, nudge randomly
+                                const angle = Math.random() * Math.PI * 2;
+                                const eps = 0.5;
+                                p.x -= Math.cos(angle) * eps;
+                                p.y -= Math.sin(angle) * eps;
+                                q.x += Math.cos(angle) * eps;
+                                q.y += Math.sin(angle) * eps;
+                                continue;
+                            }
 
-                    if (dist2 > 0 && dist2 < r2) {
-                        let dist = Math.sqrt(dist2);
-                        if (dist < 1e-4) {
-                            // If almost exactly on top of each other, nudge to avoid NaNs
-                            dx = Math.random() - 0.5;
-                            dy = Math.random() - 0.5;
-                            dist = Math.hypot(dx, dy);
-                        }
+                            const overlap = (pairRadius - dist) * 0.5;
+                            const nx = dx / dist;
+                            const ny = dy / dist;
 
-                        const nx = dx / dist;
-                        const ny = dy / dist;
-
-                        // Overlap based on the *pair* radius
-                        const overlap = (pairRadius - dist) * 0.5;
-
-                        // Separate positions
-                        p.x -= nx * overlap;
-                        p.y -= ny * overlap;
-                        q.x += nx * overlap;
-                        q.y += ny * overlap;
-
-                        // Lightly damp relative velocity along the normal
-                        const dvx = q.vx - p.vx;
-                        const dvy = q.vy - p.vy;
-                        const vn = dvx * nx + dvy * ny;
-
-                        if (vn < 0) {
-                            const impulse = vn * 0.5;
-                            p.vx += nx * impulse;
-                            p.vy += ny * impulse;
-                            q.vx -= nx * impulse;
-                            q.vy -= ny * impulse;
+                            // Move both particles apart equally
+                            p.x -= nx * overlap;
+                            p.y -= ny * overlap;
+                            q.x += nx * overlap;
+                            q.y += ny * overlap;
                         }
                     }
                 }
             }
         }
 
+        function solveBoundaries() {
+            for (const p of particles) {
+                if (p.x < p.r) p.x = p.r;
+                else if (p.x > width - p.r) p.x = width - p.r;
+
+                if (p.y < p.r) p.y = p.r;
+                else if (p.y > height - p.r) p.y = height - p.r;
+            }
+        }
 
         // Heating with pointer
         let heating = false;
@@ -303,29 +271,66 @@
             ctx.restore();
         }
 
-        // Main loop
+        function step(dt) {
+            // 1) Apply heat (changes temp)
+            applyHeat(dt);
+
+            // 2) Store previous positions for velocity reconstruction
+            for (const p of particles) {
+                p.px = p.x;
+                p.py = p.y;
+            }
+
+            // 3) Forces and predicted positions
+            for (const p of particles) {
+                // Cool toward ambient
+                p.temp += (AMBIENT_TEMP - p.temp) * COOL_RATE * dt;
+
+                const tempDiff = p.temp - AMBIENT_TEMP;
+                const ay = GRAVITY - BUOYANCY * Math.max(tempDiff, 0);
+
+                p.vy += ay * dt;
+
+                const dragFactor = Math.max(0, 1 - DRAG * dt);
+                p.vx *= dragFactor;
+                p.vy *= dragFactor;
+
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
+            }
+
+            // 4) Constraints: repulsion + boundaries (position only)
+            solveRepulsion();
+            solveBoundaries();
+
+            // 5) Recompute velocities from new positions (PBD style)
+            const invDt = 1 / dt;
+            for (const p of particles) {
+                p.vx = (p.x - p.px) * invDt;
+                p.vy = (p.y - p.py) * invDt;
+
+                const speed = Math.hypot(p.vx, p.vy);
+                if (speed > MAX_SPEED) {
+                    const s = MAX_SPEED / speed;
+                    p.vx *= s;
+                    p.vy *= s;
+                }
+            }
+        }
+
         let lastTime = performance.now();
 
         function loop(t) {
             const dtRaw = (t - lastTime) / 1000;
-            const dt = Math.min(dtRaw, 0.05); // clamp for stability
+            const dt = Math.min(dtRaw, 0.05);
             lastTime = t;
 
-            // Update physics
-            applyHeat(dt);
-            applyRepulsion();
-            for (const p of particles) {
-                p.update(dt);
-            }
+            step(dt);
 
             // Render
             ctx.clearRect(0, 0, width, height);
 
-            // Background gradient (cool bottom, hot top-ish)
-            const grad = ctx.createLinearGradient(0, height, 0, 0);
-            grad.addColorStop(0, '#050814');
-            grad.addColorStop(1, '#1a1010');
-            ctx.fillStyle = grad;
+            ctx.fillStyle = bgGrad;
             ctx.fillRect(0, 0, width, height);
 
             for (const p of particles) {
@@ -334,7 +339,6 @@
 
             drawHeatRegion();
 
-            // Draw a subtle container outline
             ctx.save();
             ctx.strokeStyle = 'rgba(255,255,255,0.2)';
             ctx.lineWidth = 2;
@@ -345,9 +349,10 @@
         }
 
         // Initialize
+        buildColorLUT();     // <-- important
         resize();
         resetParticles();
-        requestAnimationFrame(loop);
+        requestAnimationFrame(loop); 
     </script>
 </body>
 
